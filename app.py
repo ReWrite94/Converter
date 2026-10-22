@@ -9,22 +9,36 @@ JSON response schema
       {"name": "…", "size": 12345, "mime": "image/png", "sha1": "<40-hex>", "data": "<base64-utf8>"}
   ],
   "extractedTexts": [
-      "…plain text of processed document with {{<<<sha1>>>}} placeholders…"
+      {"name": "<document stem>", "text": "…plain text with {{<<<sha1>>>}} placeholders…"}
   ]
 }
 
 • Every distinct image is returned only once (duplicate detection via SHA‑1).
-• In the text, each image position is replaced by its hash placeholder.
+• In the text, each image position is replaced by its hash placeholder;
+  every placeholder hash refers to an entry in "files".
+• Images too small to be returned (icons, masks) become {{<<<icon>>>}} (PDF only).
+
+Limits (env vars)
+-----------------
+MAX_UPLOAD_MB          max. upload size                       (default 50)
+MAX_UNZIPPED_MB        max. uncompressed size of DOCX/PPTX    (default 500)
+SOFFICE_TIMEOUT        LibreOffice timeout in seconds         (default 120)
+SOFFICE_MAX_PARALLEL   concurrent LibreOffice processes       (default 2)
 """
 from __future__ import annotations
 
 import base64
+import contextlib
 import hashlib
 import html
 import mimetypes
+import os
 import pathlib
+import posixpath
 import re
+import signal
 import subprocess
+import threading
 import zipfile
 from tempfile import TemporaryDirectory
 from typing import Dict, List, Set, Tuple
@@ -35,15 +49,27 @@ PDF_TEXT_BLOCK  = getattr(fitz, "PDF_TEXT_BLOCK", 0)
 PDF_IMAGE_BLOCK = getattr(fitz, "PDF_IMAGE_BLOCK", 1)
 
 from fastapi import Depends, FastAPI, File, HTTPException, UploadFile, status
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 
 from security import api_key_auth
 
 app = FastAPI(
     title="Doc ⇄ PDF Service (JSON)",
-    version="2.4.6",  # sentinel placeholders keep 40‑hex hashes intact
+    version="2.5.0",  # PDF placeholders now {{<<<sha1>>>}} like DOCX/PPTX
+    # Auth applies to every route; exceptions are listed in security.PUBLIC_PATHS.
     dependencies=[Depends(api_key_auth)],
 )
+
+MAX_UPLOAD_BYTES     = int(os.environ.get("MAX_UPLOAD_MB", "50")) * 1024 * 1024
+MAX_UNZIPPED_BYTES   = int(os.environ.get("MAX_UNZIPPED_MB", "500")) * 1024 * 1024
+SOFFICE_TIMEOUT      = int(os.environ.get("SOFFICE_TIMEOUT", "120"))
+SOFFICE_MAX_PARALLEL = int(os.environ.get("SOFFICE_MAX_PARALLEL", "2"))
+
+# Image filter for PDFs: smaller images count as icons
+MIN_IMG_W, MIN_IMG_H = 48, 48
+MIN_IMG_AREA         = 4_000
+MIN_IMG_BYTES        = 1_024
 
 # --------------------------------------------------------------------------- #
 # Helper functions                                                             #
@@ -59,6 +85,11 @@ def sha1(data: bytes) -> str:
     return hashlib.sha1(data).hexdigest()
 
 
+def placeholder(hash_hex: str) -> str:
+    """Text marker for an image: {{<<<sha1>>>}}"""
+    return "{{<<<" + hash_hex + ">>>}}"
+
+
 def file_json(name: str, mime: str, data: bytes, *, hash_hex: str | None = None) -> dict:
     """Compose JSON snippet for one file, optionally adding the hash."""
     d = {
@@ -72,14 +103,42 @@ def file_json(name: str, mime: str, data: bytes, *, hash_hex: str | None = None)
     return d
 
 
+async def read_upload(file: UploadFile) -> Tuple[str, bytes]:
+    """Return (sanitised filename, content); enforces MAX_UPLOAD_BYTES.
+
+    The client filename is only used for suffix checks and response names –
+    never as a path on disk.
+    """
+    # PureWindowsPath strips directory parts separated by "/" *and* "\"
+    name = pathlib.PureWindowsPath(file.filename or "").name
+    if not name or name in {".", ".."}:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "missing filename")
+    data = await file.read(MAX_UPLOAD_BYTES + 1)
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            f"file larger than {MAX_UPLOAD_BYTES // (1024 * 1024)} MB",
+        )
+    return name, data
+
+
 # --------------------------------------------------------------------------- #
 # LibreOffice conversion                                                       #
 # --------------------------------------------------------------------------- #
 
+_soffice_slots = threading.BoundedSemaphore(SOFFICE_MAX_PARALLEL)
+
+
 def soffice_convert(src: pathlib.Path, outdir: pathlib.Path, *, target_fmt: str) -> pathlib.Path:
-    """Convert *src* to *target_fmt* (e.g. pdf/docx) using LibreOffice."""
+    """Convert *src* to *target_fmt* (e.g. pdf/docx) using LibreOffice.
+
+    Blocking – call via run_in_threadpool. Each call uses its own LibreOffice
+    profile so parallel conversions don't collide on the profile lock.
+    """
+    profile = (outdir / "lo-profile").as_uri()
     cmd = [
         "soffice",
+        f"-env:UserInstallation={profile}",
         "--headless",
         "--convert-to",
         target_fmt,
@@ -87,14 +146,35 @@ def soffice_convert(src: pathlib.Path, outdir: pathlib.Path, *, target_fmt: str)
         str(outdir),
         str(src),
     ]
-    res = subprocess.run(cmd, capture_output=True, text=True)
-    if res.returncode != 0:
-        raise RuntimeError(f"LibreOffice error ({res.returncode}):\n{res.stderr or res.stdout}")
-    return outdir / src.with_suffix(f".{target_fmt}").name
+    with _soffice_slots:
+        # own process group so a timeout also kills soffice.bin, not just the wrapper
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True
+        )
+        try:
+            out, err = proc.communicate(timeout=SOFFICE_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(proc.pid, signal.SIGKILL)
+            proc.communicate()
+            raise HTTPException(
+                status.HTTP_504_GATEWAY_TIMEOUT,
+                f"LibreOffice conversion timed out after {SOFFICE_TIMEOUT}s",
+            )
+
+    # LibreOffice exits with 0 on many failures – the output file is the real signal
+    dst = outdir / src.with_suffix(f".{target_fmt}").name
+    if proc.returncode != 0 or not dst.is_file():
+        msg = (err or out or "").strip()[-500:]
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"LibreOffice could not convert the file (exit {proc.returncode}): {msg}",
+        )
+    return dst
 
 
 # --------------------------------------------------------------------------- #
-# Validation helper                                                            #
+# Validation helpers                                                           #
 # --------------------------------------------------------------------------- #
 
 def validate_suffix(filename: str, *allowed: str) -> None:
@@ -104,18 +184,33 @@ def validate_suffix(filename: str, *allowed: str) -> None:
             detail=f"expected file extension {'/'.join(allowed)}",
         )
 
+
+def open_office_zip(path: pathlib.Path) -> zipfile.ZipFile:
+    """Open DOCX/PPTX as zip; reject corrupt files and zip bombs."""
+    try:
+        zf = zipfile.ZipFile(path)
+    except zipfile.BadZipFile:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "file is not a valid DOCX/PPTX")
+    # ZipExtFile never yields more than the declared file_size, so the header sum is a hard cap
+    if sum(i.file_size for i in zf.infolist()) > MAX_UNZIPPED_BYTES:
+        zf.close()
+        raise HTTPException(
+            status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            f"uncompressed content larger than {MAX_UNZIPPED_BYTES // (1024 * 1024)} MB",
+        )
+    return zf
+
 # --------------------------------------------------------------------------- #
 # Text extraction helpers                                                      #
 # --------------------------------------------------------------------------- #
 
-PDF_TEXT_BLOCK = 0
-PDF_IMAGE_BLOCK = 1
-
 _SENTINEL = "|||IMG"  # protects hashes while stripping XML tags
 
-_RE_REL  = re.compile(r"Id=\"([^\"]+)\"[^>]*Target=\"([^\"]+)\"")
-_RE_BLIP = re.compile(r"<a:blip[^>]+?r:embed=\"([^\"]+)\"[^>]*/>")
-_RE_TAGS = re.compile(r"<[^>]+>")
+_RE_REL    = re.compile(r"Id=\"([^\"]+)\"[^>]*Target=\"([^\"]+)\"")
+_RE_BLIP   = re.compile(r"<a:blip[^>]+?r:embed=\"([^\"]+)\"[^>]*/>")
+_RE_TAGS   = re.compile(r"<[^>]+>")
+_RE_SLD_ID = re.compile(r"<p:sldId\b[^>]*?r:id=\"([^\"]+)\"")
+_RE_SLIDE  = re.compile(r"ppt/slides/slide(\d+)\.xml")
 
 
 def _strip_xml_keep_sentinels(xml: str) -> str:
@@ -125,41 +220,23 @@ def _strip_xml_keep_sentinels(xml: str) -> str:
 
 def _sentinel_to_placeholder(text: str) -> str:
     pattern = re.compile(r"\|\|\|IMG([0-9a-f]{40})\|\|\|")
-    return pattern.sub(lambda m: "{{<<<" + m.group(1) + ">>>}}", text)
+    return pattern.sub(lambda m: placeholder(m.group(1)), text)
 
-# Schlüssel kann int (xref) oder Tuple[int,int] (page_idx, inline_number) sein
-ImageKey = Tuple[int, int] | int
 
-def build_image_hashes(doc: fitz.Document) -> Dict[ImageKey, str]:
-    image_hashes: Dict[ImageKey, str] = {}
+def _is_large_image(w: int, h: int, nbytes: int) -> bool:
+    return w >= MIN_IMG_W and h >= MIN_IMG_H and w * h >= MIN_IMG_AREA and nbytes >= MIN_IMG_BYTES
 
-    for page_idx, page in enumerate(doc):
-        # 1) richtige Bilder mit xref
-        for img in page.get_images(full=True):          # (xref, smask, ...)
-            xref = img[0]
-            img_bytes = doc.extract_image(xref)['image']
-            h = hashlib.sha1(img_bytes).hexdigest()
-            image_hashes[xref] = h
-
-        # 2) inline-Bilder (PyMuPDF ≥1.21 liefert sie als eigene Blöcke)
-        for blk in page.get_text("dict")["blocks"]:
-            if blk["type"] == fitz.PDF_IMAGE_BLOCK and blk.get("xref") is None:
-                inline_bytes = blk["image"]
-                h = hashlib.sha1(inline_bytes).hexdigest()
-                key = (page_idx, blk["number"])          # eindeutig im Dokument!
-                image_hashes[key] = h
-    return image_hashes
 
 def _text_from_rawdict_block(blk: dict) -> str:
     """
-    Liefert den reinen Textinhalt eines RAWDICT- oder DICT-Textblocks.
-    Kompatibel mit allen PyMuPDF-Versionen (0.x – 1.x).
+    Return the plain text of a RAWDICT or DICT text block.
+    Compatible with all PyMuPDF versions (0.x – 1.x).
     """
-    # 1) Neuere DICT-Outputs (PyMuPDF ≥ 1.19) haben 'text'
+    # 1) Newer DICT output (PyMuPDF ≥ 1.19) has 'text'
     if blk.get("text"):
         return blk["text"]
 
-    # 2) RAWDICT / DICT: Hierarchien  blocks → lines → spans
+    # 2) RAWDICT / DICT: hierarchy  blocks → lines → spans
     if "lines" in blk:
         pieces: list[str] = []
         for line in blk["lines"]:
@@ -168,10 +245,10 @@ def _text_from_rawdict_block(blk: dict) -> str:
                     pieces.append(span["text"])
                 elif span.get("chars"):                  # RAWDICT ≥ 1.21
                     pieces.append("".join(ch.get("c", "") for ch in span["chars"]))
-            pieces.append("\n")                          # Zeilenumbruch beibehalten
+            pieces.append("\n")                          # keep line breaks
         return "".join(pieces).rstrip("\n")
 
-    # 3) Sehr alte RAWDICT-Varianten (< 1.18) benutzen 'items'
+    # 3) Very old RAWDICT variants (< 1.18) use 'items'
     if "items" in blk:
         return "".join(
             it.get("text", it.get("c", ""))
@@ -183,70 +260,67 @@ def _text_from_rawdict_block(blk: dict) -> str:
 
 # --------------------------- PDF ------------------------------------------- #
 
+def collect_pdf_images(doc: fitz.Document) -> Tuple[Dict[str, dict], Dict[int, str]]:
+    """Collect large images by xref → (unique images by hash, hash by xref)."""
+    unique_by_hash: Dict[str, dict] = {}
+    hash_by_xref  : Dict[int, str]  = {}
+    seen_xrefs    : Set[int]        = set()
+
+    for page in doc:
+        for xref, *_ in page.get_images(full=True):
+            if xref in seen_xrefs:
+                continue
+            seen_xrefs.add(xref)
+            info = doc.extract_image(xref)
+            if not info:
+                continue
+            if info["cs-name"] == "DeviceGray" and info["bpc"] == 1:
+                continue  # 1‑bit mask images
+            if not _is_large_image(info["width"], info["height"], len(info["image"])):
+                continue
+
+            hsh = sha1(info["image"])
+            hash_by_xref[xref] = hsh
+            unique_by_hash.setdefault(hsh, info)
+
+    return unique_by_hash, hash_by_xref
+
+
 def extract_pdf_text_with_placeholders(
     doc: fitz.Document,
-    image_hashes: Optional[Dict[ImageKey, str]] = None
+    hash_by_xref: Dict[int, str],
+    unique_by_hash: Dict[str, dict],
 ) -> str:
     """
-    PDF-Text mit Platzhaltern extrahieren.
+    Extract PDF text with image placeholders.
 
-        • Große Bilder (≥48 px, ≥4 000 px², ≥1 KB)
-          → {{<<<sha1>>>}}
-        • Kleinere Bilder/Icon
-          → {{<<<icon>>>}}
+        • Images in *hash_by_xref*                 → {{<<<sha1>>>}}
+        • Large inline images (no xref) are added
+          to *unique_by_hash*                       → {{<<<sha1>>>}}
+        • Everything else (icons, masks)           → {{<<<icon>>>}}
+
+    So every hash in the text also appears in the file list.
     """
-    # Schwellwerte (identisch zur Sammel-Schleife in /extract/images)
-    MIN_W, MIN_H = 48, 48
-    MIN_AREA     = 4_000
-    MIN_BYTES    = 1_024
-
-    if image_hashes is None:
-        image_hashes = {}
-
     parts: List[str] = []
 
-    for page_idx, page in enumerate(doc):
-        blocks = page.get_text("rawdict")["blocks"]
+    for page in doc:
+        # rawdict image blocks carry no xref → map them via the block number
+        xref_by_block = {info["number"]: info["xref"] for info in page.get_image_info(xrefs=True)}
 
-        for blk in blocks:
+        for blk in page.get_text("rawdict")["blocks"]:
             if blk["type"] == PDF_TEXT_BLOCK:
                 parts.append(_text_from_rawdict_block(blk))
 
             elif blk["type"] == PDF_IMAGE_BLOCK:
-                # Schlüssel bestimmen
-                if blk.get("xref") is not None:
-                    key: ImageKey = blk["xref"]
-                    get_bytes = lambda: doc.extract_image(key)["image"]
-                    get_dims  = lambda: (
-                        doc.extract_image(key)["width"],
-                        doc.extract_image(key)["height"],
-                    )
-                else:  # Inline-Bild
-                    key = (page_idx, blk["number"])
-                    get_bytes = lambda: blk["image"]
-                    get_dims  = lambda: (blk["width"], blk["height"])
-
-                # Bild bereits akzeptiert → Platzhalter mit Hash
-                if key in image_hashes:
-                    parts.append(f"{{<<<{image_hashes[key]}>>>}}")
-                    continue
-
-                # Neu bewerten (nur für Inline oder selten übersehene XObjects)
-                img_bytes = get_bytes()
-                w, h      = get_dims()
-
-                if (
-                    w >= MIN_W and h >= MIN_H and
-                    w * h >= MIN_AREA and
-                    len(img_bytes) >= MIN_BYTES
-                ):
-                    # Groß genug → Hash berechnen, merken, Platzhalter ausgeben
-                    hsh = hashlib.sha1(img_bytes).hexdigest()
-                    image_hashes[key] = hsh
-                    parts.append(f"{{<<<{hsh}>>>}}")
-                else:
-                    # Zu klein → Icon-Marker
-                    parts.append("{{<<<icon>>>}}")
+                xref = xref_by_block.get(blk["number"], 0)
+                hsh: str | None = None
+                if xref:
+                    hsh = hash_by_xref.get(xref)
+                elif _is_large_image(blk["width"], blk["height"], len(blk["image"])):
+                    # inline image: only reachable through the text layer
+                    hsh = sha1(blk["image"])
+                    unique_by_hash.setdefault(hsh, {"ext": blk["ext"], "image": blk["image"]})
+                parts.append(placeholder(hsh) if hsh else "{{<<<icon>>>}}")
 
     return "\n".join(parts).strip()
 
@@ -281,11 +355,34 @@ def extract_docx_text_with_placeholders(zf: zipfile.ZipFile, img_hash_by_member:
 
 # --------------------------- PPTX ------------------------------------------ #
 
+def _pptx_slide_paths(zf: zipfile.ZipFile) -> List[str]:
+    """Slide XML paths in presentation order (falls back to numeric order)."""
+    names = set(zf.namelist())
+    try:
+        pres_xml  = zf.read("ppt/presentation.xml").decode("utf‑8", "ignore")
+        pres_rels = zf.read("ppt/_rels/presentation.xml.rels").decode("utf‑8", "ignore")
+    except KeyError:
+        pass
+    else:
+        rid2tgt = dict(_RE_REL.findall(pres_rels))
+        ordered = []
+        for rid in _RE_SLD_ID.findall(pres_xml):
+            tgt = rid2tgt.get(rid)
+            if tgt:
+                path = tgt.lstrip("/") if tgt.startswith("/") else posixpath.normpath(posixpath.join("ppt", tgt))
+                if path in names:
+                    ordered.append(path)
+        if ordered:
+            return ordered
+
+    numbered = [(int(m.group(1)), n) for n in names if (m := _RE_SLIDE.fullmatch(n))]
+    return [n for _, n in sorted(numbered)]
+
+
 def extract_pptx_text_with_placeholders(zf: zipfile.ZipFile, img_hash_by_member: Dict[str, str]) -> str:
-    slide_paths = [n for n in zf.namelist() if n.startswith("ppt/slides/slide") and n.endswith(".xml")]
     chunks: List[str] = []
 
-    for slide_xml_path in sorted(slide_paths):
+    for slide_xml_path in _pptx_slide_paths(zf):
         rels_path = slide_xml_path.replace("/slides/", "/slides/_rels/") + ".rels"
         rid_map: Dict[str, str] = {}
         if rels_path in zf.namelist():
@@ -311,62 +408,41 @@ def extract_pptx_text_with_placeholders(zf: zipfile.ZipFile, img_hash_by_member:
     return "\n".join(chunks).strip()
 
 # --------------------------------------------------------------------------- #
-# Routes                                                                       #
+# Blocking workers (run in threadpool, never on the event loop)                #
 # --------------------------------------------------------------------------- #
 
-@app.post("/convert/docx-to-pdf")
-async def docx_to_pdf(file: UploadFile = File(...)):
-    """Convert DOCX → PDF."""
-    validate_suffix(file.filename, ".docx")
+def _convert_to_pdf(name: str, data: bytes, suffix: str) -> dict:
     with TemporaryDirectory() as td:
-        src = pathlib.Path(td) / file.filename
-        src.write_bytes(await file.read())
-        pdf_path = soffice_convert(src, src.parent, target_fmt="pdf")
-        pdf_bytes = pdf_path.read_bytes()
-    return JSONResponse({
-        "files": [file_json(pdf_path.name, "application/pdf", pdf_bytes, hash_hex=sha1(pdf_bytes))],
+        src = pathlib.Path(td) / f"input{suffix}"
+        src.write_bytes(data)
+        pdf_bytes = soffice_convert(src, src.parent, target_fmt="pdf").read_bytes()
+    pdf_name = f"{pathlib.Path(name).stem}.pdf"
+    return {
+        "files": [file_json(pdf_name, "application/pdf", pdf_bytes, hash_hex=sha1(pdf_bytes))],
         "extractedTexts": []
-    })
+    }
 
 
-@app.post("/convert/pptx-to-pdf")
-async def pptx_to_pdf(file: UploadFile = File(...)):
-    """Convert PPTX → PDF."""
-    validate_suffix(file.filename, ".pptx")
-    with TemporaryDirectory() as td:
-        src = pathlib.Path(td) / file.filename
-        src.write_bytes(await file.read())
-        pdf_path = soffice_convert(src, src.parent, target_fmt="pdf")
-        pdf_bytes = pdf_path.read_bytes()
-    return JSONResponse({
-        "files": [file_json(pdf_path.name, "application/pdf", pdf_bytes, hash_hex=sha1(pdf_bytes))],
-        "extractedTexts": []
-    })
-
-
-@app.post("/extract/images-office")
-async def extract_images_office(file: UploadFile = File(...)):
-    """Extract deduplicated images + placeholder‑rich text from DOCX/PPTX (+ legacy DOC/PPT)."""
-    name   = file.filename
+def _extract_office(name: str, data: bytes) -> dict:
     suffix = pathlib.Path(name).suffix.lower()
+    if suffix not in {".doc", ".docx", ".ppt", ".pptx"}:
+        raise HTTPException(400, "supported extensions: .doc/.docx/.ppt/.pptx")
 
     with TemporaryDirectory() as td:
-        in_path = pathlib.Path(td) / name
-        in_path.write_bytes(await file.read())
+        in_path = pathlib.Path(td) / f"input{suffix}"
+        in_path.write_bytes(data)
 
         # legacy → OpenXML so the rest stays identical
         if suffix in {".doc", ".ppt"}:
             target_ext = "docx" if suffix == ".doc" else "pptx"
             in_path = soffice_convert(in_path, in_path.parent, target_fmt=target_ext)
             suffix = f".{target_ext}"
-        elif suffix not in {".docx", ".pptx"}:
-            raise HTTPException(400, "supported extensions: .doc/.docx/.ppt/.pptx")
 
         files: List[dict]    = []
         img_hash_by_member   : Dict[str, str] = {}
         seen_hashes: Set[str] = set()
 
-        with zipfile.ZipFile(in_path) as zf:
+        with open_office_zip(in_path) as zf:
             media_members = [n for n in zf.namelist() if "/media/" in n]
             for member in media_members:
                 data = zf.read(member)
@@ -384,50 +460,26 @@ async def extract_images_office(file: UploadFile = File(...)):
                 mime = mimetypes.guess_type(member)[0] or f"image/{ext}"
                 files.append(file_json(f"img_{len(files)+1:04}.{ext}", mime, data, hash_hex=h))
 
-            text = (extract_docx_text_with_placeholders if suffix == ".docx" else extract_pptx_text_with_placeholders)(zf, img_hash_by_member)
+            try:
+                text = (extract_docx_text_with_placeholders if suffix == ".docx" else extract_pptx_text_with_placeholders)(zf, img_hash_by_member)
+            except KeyError as e:  # mandatory part missing, e.g. word/document.xml
+                raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, f"invalid document: {e}")
 
-    return JSONResponse({
+    return {
         "files": files,
-        "extractedTexts": [{"name": pathlib.Path(file.filename).stem, "text": text}]
-    })
+        "extractedTexts": [{"name": pathlib.Path(name).stem, "text": text}]
+    }
 
 
-@app.post("/extract/images")
-async def extract_images(file: UploadFile = File(...)):
-    """Extract deduplicated images + placeholder‑rich text from a PDF."""
-    validate_suffix(file.filename, ".pdf")
+def _extract_pdf(name: str, data: bytes) -> dict:
+    try:
+        doc = fitz.open(stream=data, filetype="pdf")
+    except Exception:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "file is not a valid PDF")
 
-    MIN_W, MIN_H = 48, 48
-    MIN_AREA     = 4_000
-    MIN_BYTES    = 1_024
-
-    unique_by_hash: Dict[str, dict] = {}
-    hash_by_xref : Dict[int, str]   = {}
-
-    with TemporaryDirectory() as td:
-        pdf_path = pathlib.Path(td) / file.filename
-        pdf_path.write_bytes(await file.read())
-        doc = fitz.open(pdf_path)
-
-        for page in doc:
-            for xref, *_ in page.get_images(full=True):
-                info = doc.extract_image(xref)
-                w, h = info["width"], info["height"]
-
-                if info["cs-name"] == "DeviceGray" and info["bpc"] == 1:
-                    continue  # 1‑bit mask images
-                if w < MIN_W or h < MIN_H or w * h < MIN_AREA:
-                    continue
-                if len(info["image"]) < MIN_BYTES:
-                    continue
-
-                hsh = sha1(info["image"])
-                hash_by_xref[xref] = hsh
-                if hsh in unique_by_hash:
-                    continue
-                unique_by_hash[hsh] = info
-
-        text = extract_pdf_text_with_placeholders(doc, hash_by_xref)
+    with doc:
+        unique_by_hash, hash_by_xref = collect_pdf_images(doc)
+        text = extract_pdf_text_with_placeholders(doc, hash_by_xref, unique_by_hash)
 
     files = [
         file_json(
@@ -439,10 +491,44 @@ async def extract_images(file: UploadFile = File(...)):
         for i, (h, img) in enumerate(unique_by_hash.items(), 1)
     ]
 
-    return JSONResponse({
+    return {
         "files": files,
-        "extractedTexts": [{"name": pathlib.Path(file.filename).stem, "text": text}]
-    })
+        "extractedTexts": [{"name": pathlib.Path(name).stem, "text": text}]
+    }
+
+# --------------------------------------------------------------------------- #
+# Routes                                                                       #
+# --------------------------------------------------------------------------- #
+
+@app.post("/convert/docx-to-pdf")
+async def docx_to_pdf(file: UploadFile = File(...)):
+    """Convert DOCX → PDF."""
+    name, data = await read_upload(file)
+    validate_suffix(name, ".docx")
+    return JSONResponse(await run_in_threadpool(_convert_to_pdf, name, data, ".docx"))
+
+
+@app.post("/convert/pptx-to-pdf")
+async def pptx_to_pdf(file: UploadFile = File(...)):
+    """Convert PPTX → PDF."""
+    name, data = await read_upload(file)
+    validate_suffix(name, ".pptx")
+    return JSONResponse(await run_in_threadpool(_convert_to_pdf, name, data, ".pptx"))
+
+
+@app.post("/extract/images-office")
+async def extract_images_office(file: UploadFile = File(...)):
+    """Extract deduplicated images + placeholder‑rich text from DOCX/PPTX (+ legacy DOC/PPT)."""
+    name, data = await read_upload(file)
+    return JSONResponse(await run_in_threadpool(_extract_office, name, data))
+
+
+@app.post("/extract/images")
+async def extract_images(file: UploadFile = File(...)):
+    """Extract deduplicated images + placeholder‑rich text from a PDF."""
+    name, data = await read_upload(file)
+    validate_suffix(name, ".pdf")
+    return JSONResponse(await run_in_threadpool(_extract_pdf, name, data))
 
 
 # --------------------------------------------------------------------------- #
