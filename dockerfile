@@ -6,7 +6,7 @@ ENV PYTHONUNBUFFERED=1
 # ── Systempakete ─────────────────────────────────────────────────────────────
 RUN apt-get update && apt-get install -y --no-install-recommends \
       libreoffice-writer libreoffice-impress libreoffice-calc libreoffice-core \
-      fontconfig fonts-dejavu-core fonts-liberation \
+      fontconfig fonts-dejavu-core fonts-liberation curl wget \
   && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # ── Python deps ─────────────────────────────────────────────────────────────
